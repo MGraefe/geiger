@@ -18,6 +18,8 @@ uint32_t g_millis = 0;
 
 uint8_t g_piezo_beep = 0;
 uint32_t g_timer1_cycles = 0;
+uint32_t g_next_voltage_check = 0;
+uint16_t g_tube_duty = 0;
 
 
 // duty between 0 and UINT16_MAX
@@ -25,6 +27,19 @@ void set_mosfet_pwm(uint16_t duty)
 {
 	uint32_t duty32 = duty;
 	OCR1A = (uint16_t)(duty32 * ICR1 / UINT16_MAX);
+}
+
+
+uint16_t read_analog(uint8_t i)
+{
+	uint8_t l, h;
+
+	ADMUX = i;
+	ADCSRA |= (1 << ADSC);
+	while(ADCSRA & (1 << ADSC)) {};
+	l = ADCL;
+	h = ADCH;
+	return (h << 8) | l;
 }
 
 
@@ -53,6 +68,9 @@ void init()
 	TCCR1A = (1 << COM1A1) | (1 << WGM11);
 	TCCR1B = (1 << WGM12)  | (1 << WGM13) | (1 << CS10);
 	OCR1A = 0; // Output 0
+
+	// Set ADC Converter enabled and 128 prescaler
+	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
 	
 	sei(); //enable interrupts
 }
@@ -73,11 +91,31 @@ ISR(PCINT1_vect)
 #define CYLCES_PER_MS (F_CPU / 1000L)
 ISR(TIMER0_OVF_vect)
 {
+	uint32_t millis;
+
 	// Add cycles to g_timer1_cycles and subtract whole milliseconds from it
 	g_timer1_cycles += CYCLES_PER_TIMER0;
-	uint32_t millis = g_timer1_cycles / CYLCES_PER_MS;
+	millis = g_timer1_cycles / CYLCES_PER_MS;
 	g_timer1_cycles -= millis * CYLCES_PER_MS;
 	g_millis += millis;
+}
+
+
+void voltageReg()
+{
+	uint16_t value;
+	if (g_millis > g_next_voltage_check)
+	{
+		g_next_voltage_check = g_millis + 100;
+		value = read_analog(5);
+		// vcc is 5 volts and conversion factor is 1V sensed = 200V tube voltage
+		float voltage = value * ((1.0f/1023.0f) * 5.0f * 200.0f); 
+		if (voltage < 395.0f && g_tube_duty < (UINT16_MAX / 100 * 70))
+			g_tube_duty += (UINT16_MAX / 100 * 10); // + 10%
+		else if (voltage > 405.0f && g_tube_duty > (UINT16_MAX / 100 * 10))
+			g_tube_duty -= (UINT16_MAX / 100 * 1); // -1 %
+		set_mosfet_pwm(g_tube_duty);
+	}
 }
 
 
@@ -95,6 +133,10 @@ void loop()
 		_delay_us(100);
 		pin_set(PIN_PIEZO, 0);
 	}
+
+	voltageReg();
+
+
 	_delay_ms(1);
 }
 

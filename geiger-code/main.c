@@ -15,11 +15,14 @@ uint32_t g_millis = 0;
 
 #define PIN_PIEZO pin_create(PORT_C, 0)
 #define PIN_NMOSG pin_create(PORT_B, 1)
+#define PIN_DETECT pin_create(PORT_C, 4)
+#define PIN_VSENSE pin_create(PORT_C, 5)
 
 uint8_t g_piezo_beep = 0;
 uint32_t g_timer1_cycles = 0;
 uint32_t g_next_voltage_check = 0;
-uint16_t g_tube_duty = 0;
+uint32_t g_next_lcd_update = 0;
+uint16_t g_tube_duty = (UINT16_MAX / 100 * 5); //5 % start
 
 
 // duty between 0 and UINT16_MAX
@@ -34,7 +37,7 @@ uint16_t read_analog(uint8_t i)
 {
 	uint8_t l, h;
 
-	ADMUX = i;
+	ADMUX = (1 << REFS0) | (i & 0x7);
 	ADCSRA |= (1 << ADSC);
 	while(ADCSRA & (1 << ADSC)) {};
 	l = ADCL;
@@ -49,10 +52,13 @@ void init()
 	
 	pin_set_inout(PIN_PIEZO, 1);
 	pin_set_inout(PIN_NMOSG, 1);
+	pin_set_inout(PIN_DETECT, 0);
+	pin_set_inout(PIN_VSENSE, 0);
+	pin_set(PIN_DETECT, 1); // Enable internal pullup
 	
-	lcd_init(lcd, 1, pin_create(PORT_D, 0), pin_create(PORT_D, 1), pin_create(PORT_D, 2), 
-		pin_create(PORT_D, 4), pin_create(PORT_D, 5), pin_create(PORT_D, 6), pin_create(PORT_D, 7), 0, 0, 0, 0);
-	lcd_begin(lcd, 16, 2, LCD_5x8DOTS);
+	//lcd_init(lcd, 1, pin_create(PORT_D, 0), pin_create(PORT_D, 1), pin_create(PORT_D, 2), 
+		//pin_create(PORT_D, 4), pin_create(PORT_D, 5), pin_create(PORT_D, 6), pin_create(PORT_D, 7), 0, 0, 0, 0);
+	//lcd_begin(lcd, 16, 2, LCD_5x8DOTS);
 	
 	// Pin change interrupt for handling geiger pulses
 	PCICR |= (1 << PCIE1); // enable PCINT1 Interrupt Vector
@@ -101,6 +107,16 @@ ISR(TIMER0_OVF_vect)
 }
 
 
+uint16_t clamp(uint16_t val, uint16_t min, uint16_t max)
+{
+	if (val < min)
+		return min;
+	if (val > max)
+		return max;
+	return val;
+}
+
+
 void voltageReg()
 {
 	uint16_t value;
@@ -109,11 +125,12 @@ void voltageReg()
 		g_next_voltage_check = g_millis + 100;
 		value = read_analog(5);
 		// vcc is 5 volts and conversion factor is 1V sensed = 200V tube voltage
-		float voltage = value * ((1.0f/1023.0f) * 5.0f * 200.0f); 
-		if (voltage < 395.0f && g_tube_duty < (UINT16_MAX / 100 * 70))
-			g_tube_duty += (UINT16_MAX / 100 * 10); // + 10%
-		else if (voltage > 405.0f && g_tube_duty > (UINT16_MAX / 100 * 10))
-			g_tube_duty -= (UINT16_MAX / 100 * 1); // -1 %
+		float voltage = value * ((1.0f/1023.0f) * 5.0f * 200.0f);
+		float diff = 400.0f - voltage;
+		if (voltage < 395.0f && g_tube_duty < (UINT16_MAX / 100 * 30))
+			g_tube_duty += (UINT16_MAX / 100 / 5); // +0.2%
+		else if (voltage > 405.0f && g_tube_duty > (UINT16_MAX / 100 * 2))
+			g_tube_duty -= (UINT16_MAX / 100 / 5); // -0.2 %
 		set_mosfet_pwm(g_tube_duty);
 	}
 }
@@ -121,17 +138,21 @@ void voltageReg()
 
 void loop()
 {
-	char string[32] = "Count: ";
-	ltoa(g_pulses, string + 7, 10);
-	
-	lcd_home(lcd);
-	lcd_write_str(lcd, string);
+	if (g_millis > g_next_lcd_update)
+	{
+		char string[32] = "Count: ";
+		ltoa(g_pulses, string + 7, 10);
+		lcd_home(lcd);
+		lcd_write_str(lcd, string);
+		g_next_lcd_update = g_millis + 200;
+	}
 	
 	if (g_piezo_beep)
 	{
 		pin_set(PIN_PIEZO, 1);
 		_delay_us(100);
 		pin_set(PIN_PIEZO, 0);
+		g_piezo_beep = 0;
 	}
 
 	voltageReg();
@@ -143,6 +164,7 @@ void loop()
 
 int main(void)
 {
+	_delay_ms(100);
 	init();
 	
     while (1) 

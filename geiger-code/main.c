@@ -56,9 +56,9 @@ void init()
 	pin_set_inout(PIN_VSENSE, 0);
 	pin_set(PIN_DETECT, 1); // Enable internal pullup
 	
-	//lcd_init(lcd, 1, pin_create(PORT_D, 0), pin_create(PORT_D, 1), pin_create(PORT_D, 2), 
-		//pin_create(PORT_D, 4), pin_create(PORT_D, 5), pin_create(PORT_D, 6), pin_create(PORT_D, 7), 0, 0, 0, 0);
-	//lcd_begin(lcd, 16, 2, LCD_5x8DOTS);
+	lcd_init(lcd, 1, pin_create(PORT_D, 0), pin_create(PORT_D, 1), pin_create(PORT_D, 2), 
+		pin_create(PORT_D, 4), pin_create(PORT_D, 5), pin_create(PORT_D, 6), pin_create(PORT_D, 7), 0, 0, 0, 0);
+	lcd_begin(lcd, 16, 2, LCD_5x8DOTS);
 	
 	// Pin change interrupt for handling geiger pulses
 	PCICR |= (1 << PCIE1); // enable PCINT1 Interrupt Vector
@@ -113,7 +113,6 @@ uint16_t clamp(uint16_t val, uint16_t min, uint16_t max)
 		return min;
 	if (val > max)
 		return max;
-	return val;
 }
 
 

@@ -3,6 +3,7 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <avr/sleep.h>
+#include <avr/power.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,7 +15,7 @@ struct Lcd *lcd = &lcd_data;
 uint32_t g_pulses = 0;
 uint16_t g_pulses_current_second = 0;
 uint32_t g_millis = 0;
-uint16_t g_cpm = 0;
+uint32_t g_cpm = 0;
 
 #define PIN_PIEZO pin_create(PORT_C, 0)
 #define PIN_NMOSG pin_create(PORT_B, 1)
@@ -27,12 +28,13 @@ uint32_t g_timer1_cycles = 0;
 uint32_t g_next_voltage_check = 0;
 uint32_t g_next_lcd_update = 0;
 uint32_t g_next_cpm_update = 0;
-uint16_t g_tube_duty = (UINT16_MAX / 100 * 5); //5 % start
-uint16_t g_impulse_bins[NUM_IMPULSE_BINS];
+int16_t g_tube_voltage;
+uint16_t g_tube_duty = 0;
+uint32_t g_impulse_bins[NUM_IMPULSE_BINS];
 uint8_t g_bins_pos = 0;
 uint8_t g_bins_count = 0;
 
-uint16_t impulse_bin_sum(uint8_t max_num)
+uint32_t impulse_bin_sum(uint8_t max_num)
 {
 	if (g_bins_count == 0)
 	return 0;
@@ -41,8 +43,7 @@ uint16_t impulse_bin_sum(uint8_t max_num)
 	uint8_t count = 0;
 	while(count < g_bins_count && count < max_num)
 	{
-		uint16_t tv = g_impulse_bins[i++];
-		val += tv;
+		val += g_impulse_bins[i++];
 		if (i == NUM_IMPULSE_BINS)
 			i = 0;
 		count++;
@@ -50,7 +51,7 @@ uint16_t impulse_bin_sum(uint8_t max_num)
 	return val;
 }
 
-void impulse_bin_add(uint16_t impulses)
+void impulse_bin_add(uint32_t impulses)
 {
 	if (g_bins_pos == NUM_IMPULSE_BINS)
 		g_bins_pos = 0;
@@ -105,18 +106,20 @@ void init()
 	#define CYCLES_PER_TIMER2 (1024L * 256L)
 	
 	// Set timer 1 for 10 bit non inverting fast pwm at 20 kHz for mosfet control
-	ICR1 = F_CPU / 20000L; // 16 MHz / 20kHz = 800
+	ICR1 = F_CPU / 10000L; // 8 MHz / 20kHz = 800
 	TCCR1A = (1 << COM1A1) | (1 << WGM11);
 	TCCR1B = (1 << WGM12)  | (1 << WGM13) | (1 << CS10);
+	//TIMSK1 = (1 << TOIE1);
 	OCR1A = 0; // Output 0
 
 	// Set ADC Converter enabled and 128 prescaler
 	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
 
-	// Power reduction (saves aprox 0.4 mA)
+	// Power reduction
 	PRR = (1 << PRTIM0) // Timer 0
 		| (1 << PRTWI) // TWI (Two wire interface)
-		| (1 << PRUSART0); // USART
+		| (1 << PRUSART0) // USART
+		| (1 << PRSPI); // SPI
 
 	sei(); //enable interrupts
 }
@@ -134,7 +137,7 @@ ISR(PCINT1_vect)
 }
 
 
-//Timer2 interrupt function (called every 1024 * 256 cycles)
+//Timer2 interrupt function (called every 1024 * 256 cycles = 32,768ms @ 8MHz)
 #define CYLCES_PER_MS (F_CPU / 1000L)
 ISR(TIMER2_OVF_vect)
 {
@@ -161,15 +164,20 @@ uint16_t clamp(uint16_t val, uint16_t min, uint16_t max)
 void voltageReg()
 {
 	uint16_t value;
-	g_next_voltage_check = g_millis + 100;
+	PRR &= ~(1 << PRADC); //enable adc in prr
+	ADCSRA |= (1 << ADEN); //enable adc
 	value = read_analog(5);
-	// vcc is 5 volts and conversion factor is 1V sensed = 200V tube voltage
-	float voltage = value * ((1.0f/1023.0f) * 5.0f * 200.0f);
-	//float diff = 400.0f - voltage;
-	if (voltage < 395.0f && g_tube_duty < (UINT16_MAX / 100 * 30))
-		g_tube_duty += (UINT16_MAX / 100 / 5); // +0.2%
-	else if (voltage > 405.0f && g_tube_duty > (UINT16_MAX / 100 * 2))
-		g_tube_duty -= (UINT16_MAX / 100 / 5); // -0.2 %
+	ADCSRA &= ~(1 << ADEN); //disable adc
+	PRR |= (1 << PRADC); //disable adc in prr
+
+	// vcc is 5 volts and conversion factor is 1V sensed = 200V tube voltage, scale times 64 to get meaningful result
+	g_tube_voltage = value * 64 / (uint16_t)((1.0f/1023.0f) * 5.0f * 200.0f * 64.0f + 0.5f);
+	int16_t diff = 400 - g_tube_voltage;
+
+	if (g_tube_voltage < 395 && g_tube_duty < (UINT16_MAX / 100 * 50))
+		g_tube_duty += (UINT16_MAX / 1000) * clamp(diff / 8, 1, 20);
+	else if (g_tube_voltage > 405 && g_tube_duty > (UINT16_MAX / 100 * 2))
+		g_tube_duty -= (UINT16_MAX / 1000) * clamp(-diff / 8, 1, 20);
 	set_mosfet_pwm(g_tube_duty);
 }
 
@@ -192,7 +200,7 @@ void reverse(char *str, int length)
 }
 
 // Implementation of itoa()
-char* itoa_fill(int num, char* str, int base)
+int itoa_fill(int num, char* str, int base)
 {
 	int i = 0;
 	uint8_t isNegative = 0;
@@ -201,7 +209,7 @@ char* itoa_fill(int num, char* str, int base)
 	if (num == 0)
 	{
 		str[i++] = '0';
-		return str;
+		return i;
 	}
 	
 	// In standard itoa(), negative numbers are handled only with
@@ -227,7 +235,7 @@ char* itoa_fill(int num, char* str, int base)
 	// Reverse the string
 	reverse(str, i);
 	
-	return str;
+	return i;
 }
 
 
@@ -236,11 +244,16 @@ void update_lcd()
 	char line[32];
 	memset(line, ' ', 16);
 
-	memcpy(line, "cnt:", 4);
-	itoa_fill(g_pulses, line + (g_pulses > 9999 ? 3 : 4), 10);
+	itoa_fill(g_pulses, line, 10);
 
-	memcpy(line + 8, "cpm:", 4);
-	itoa_fill(g_cpm, line + (g_cpm > 9999 ? 11 : 12), 10);
+	int len = itoa_fill(g_tube_voltage, line + 3, 10);
+	line[3 + len] = 'V';
+
+	len = itoa_fill(g_tube_duty / (UINT16_MAX / 100), line + 7, 10);
+	line[7 + len] = '%';
+
+	len = itoa_fill(g_cpm, line + 11, 10);
+	memcpy(line + 11 + len, "cpm", 3);
 
 	line[16] = 0;
 	lcd_home(lcd);
@@ -249,7 +262,13 @@ void update_lcd()
 	memset(line, ' ', 16);
 	itoa_fill(g_millis / 1000, line, 10);
 
-	uint16_t usv = (uint32_t)g_cpm * 10000LL / 15835LL;
+	uint32_t usv = g_cpm * 10000LL / 15835LL;
+	uint8_t is_msv = 0;
+	if (usv > 99999)
+	{
+		usv /= 1000;
+		is_msv = 1;
+	}
 	uint16_t wholeuSv = usv / 100;
 	uint16_t commauSv = usv % 100;
 	itoa_fill(wholeuSv, line + 5 + (wholeuSv < 10 ? 2 : wholeuSv < 100 ? 1 : 0), 10);
@@ -259,6 +278,8 @@ void update_lcd()
 	itoa_fill(commauSv, line + 9 + (commauSv < 10 ? 1 : 0), 10);
 
 	memcpy(line + 11, "uSv/h", 5);
+	if (is_msv)
+		line[11] = 'm';
 
 	line[16] = 0;
 	lcd_setCursor(lcd, 0, 1);
@@ -292,7 +313,7 @@ void loop()
 	if (g_millis > g_next_voltage_check)
 	{
 		voltageReg();
-		g_next_voltage_check = g_millis + 100;
+		g_next_voltage_check = g_millis + 200;
 	}
 
 	set_sleep_mode(SLEEP_MODE_IDLE);

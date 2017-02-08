@@ -12,16 +12,18 @@
 
 struct Lcd lcd_data;
 struct Lcd *lcd = &lcd_data;
-uint32_t g_pulses = 0;
-uint16_t g_pulses_current_second = 0;
+uint16_t g_pulses = 0;
+uint16_t g_pulses_measurement = 0;
 uint32_t g_millis = 0;
 uint32_t g_cpm = 0;
+uint16_t g_usv = 0;
+uint8_t g_is_msv = 0;
+uint32_t g_millis_measurement_started = 0;
 
 #define PIN_PIEZO pin_create(PORT_C, 0)
 #define PIN_NMOSG pin_create(PORT_B, 1)
 #define PIN_DETECT pin_create(PORT_C, 4)
 #define PIN_VSENSE pin_create(PORT_C, 5)
-#define NUM_IMPULSE_BINS 60
 
 uint8_t g_piezo_beep = 0;
 uint32_t g_timer1_cycles = 0;
@@ -30,35 +32,7 @@ uint32_t g_next_lcd_update = 0;
 uint32_t g_next_cpm_update = 0;
 int16_t g_tube_voltage;
 uint16_t g_tube_duty = 0;
-uint32_t g_impulse_bins[NUM_IMPULSE_BINS];
-uint8_t g_bins_pos = 0;
-uint8_t g_bins_count = 0;
 
-uint32_t impulse_bin_sum(uint8_t max_num)
-{
-	if (g_bins_count == 0)
-	return 0;
-	uint32_t val = 0;
-	uint8_t i = (g_bins_count < NUM_IMPULSE_BINS || g_bins_pos == NUM_IMPULSE_BINS) ? 0 : g_bins_pos;
-	uint8_t count = 0;
-	while(count < g_bins_count && count < max_num)
-	{
-		val += g_impulse_bins[i++];
-		if (i == NUM_IMPULSE_BINS)
-			i = 0;
-		count++;
-	}
-	return val;
-}
-
-void impulse_bin_add(uint32_t impulses)
-{
-	if (g_bins_pos == NUM_IMPULSE_BINS)
-		g_bins_pos = 0;
-	g_impulse_bins[g_bins_pos++] = impulses;
-	if (g_bins_count < NUM_IMPULSE_BINS)
-		g_bins_count++;
-}
 
 // duty between 0 and UINT16_MAX
 void set_mosfet_pwm(uint16_t duty)
@@ -106,7 +80,7 @@ void init()
 	#define CYCLES_PER_TIMER2 (1024L * 256L)
 	
 	// Set timer 1 for 10 bit non inverting fast pwm at 20 kHz for mosfet control
-	ICR1 = F_CPU / 10000L; // 8 MHz / 20kHz = 800
+	ICR1 = F_CPU / 15000L; // 8 MHz / 20kHz = 800
 	TCCR1A = (1 << COM1A1) | (1 << WGM11);
 	TCCR1B = (1 << WGM12)  | (1 << WGM13) | (1 << CS10);
 	//TIMSK1 = (1 << TOIE1);
@@ -131,7 +105,7 @@ ISR(PCINT1_vect)
 	if ((PINC & (1 << PINC4)) == 0) // trigger on low flank
 	{
 		++g_pulses;
-		++g_pulses_current_second;
+		++g_pulses_measurement;
 		g_piezo_beep = 1;
 	}
 }
@@ -262,15 +236,8 @@ void update_lcd()
 	memset(line, ' ', 16);
 	itoa_fill(g_millis / 1000, line, 10);
 
-	uint32_t usv = g_cpm * 10000LL / 15835LL;
-	uint8_t is_msv = 0;
-	if (usv > 99999)
-	{
-		usv /= 1000;
-		is_msv = 1;
-	}
-	uint16_t wholeuSv = usv / 100;
-	uint16_t commauSv = usv % 100;
+	uint16_t wholeuSv = g_usv / 100;
+	uint16_t commauSv = g_usv % 100;
 	itoa_fill(wholeuSv, line + 5 + (wholeuSv < 10 ? 2 : wholeuSv < 100 ? 1 : 0), 10);
 	line[8] = '.';
 	if (commauSv < 10)
@@ -278,7 +245,7 @@ void update_lcd()
 	itoa_fill(commauSv, line + 9 + (commauSv < 10 ? 1 : 0), 10);
 
 	memcpy(line + 11, "uSv/h", 5);
-	if (is_msv)
+	if (g_is_msv)
 		line[11] = 'm';
 
 	line[16] = 0;
@@ -290,10 +257,29 @@ void loop()
 {
 	if (g_millis > g_next_cpm_update)
 	{
-		g_next_cpm_update += 1000;
-		impulse_bin_add(g_pulses_current_second);
-		g_pulses_current_second = 0;
-		g_cpm = impulse_bin_sum(255) * (60 / (g_bins_count == 0 ? 1 : g_bins_count));
+		g_next_cpm_update += 2000; // Update every 2 seconds
+		uint32_t elapsed = g_millis - g_millis_measurement_started;
+		if (g_pulses_measurement > 100 || elapsed > 5)
+		{
+			float cpm = (float)g_pulses_measurement * 60.0f / (elapsed * 0.001f);
+			g_cpm = (uint16_t)(cpm + 0.5f);
+			float usv = cpm * 0.006315f; // Factor for SBM-20
+			g_is_msv = 0;
+			if (usv > 99.99f)
+			{
+				usv *= 0.001f;
+				g_is_msv = 1;
+			}
+			g_usv = (uint16_t)(usv * 100.0f);
+		}
+
+		if (g_pulses_measurement > 100)
+		{
+			g_millis_measurement_started = g_millis;
+			cli();
+			g_pulses_measurement = 0;
+			sei();
+		}
 	}
 	
 	if (g_millis > g_next_lcd_update)
@@ -313,7 +299,7 @@ void loop()
 	if (g_millis > g_next_voltage_check)
 	{
 		voltageReg();
-		g_next_voltage_check = g_millis + 200;
+		g_next_voltage_check = g_millis + 100; // more relaxed afterwards
 	}
 
 	set_sleep_mode(SLEEP_MODE_IDLE);
